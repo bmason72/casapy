@@ -1,0 +1,9 @@
+
+from taskinit import *                                                                                
+# we think not needed-
+#import casadef                                                                                        
+
+# This arrangement allows you to call casa commands by name: - T. Hunter                              
+from listobs_cli import listobs_cli as listobs                                                        
+from gencal_cli import gencal_cli as gencal
+# etc...
