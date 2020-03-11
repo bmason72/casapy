@@ -24,7 +24,10 @@ def capRatios(tapers):
   return -1
 
 
-def runTimeRatios(uvtapers,cfg_pair):
+def runTimeRatios(uvtapers,cfg_pair,usenull=False):
+    """
+    usenull = use null taper for 2nd in pair (assumes uvtapers[0] is null taper)
+    """
     bl=getBaselineLengths()
     tsums2,tsums=getTaperedSums(bl,uvtapers)
 
@@ -33,7 +36,7 @@ def runTimeRatios(uvtapers,cfg_pair):
     for this_pair in cfg_pair:
 
         tperptg,tmos,nb1,nb2 = compareTwoConfigs(tsums,tsums2,this_pair['bmind'],cfg1 = this_pair['cfgA'], diam_1 = this_pair['dA'],
-                                                    cfg2 = this_pair['cfgB'], diam_2 = this_pair['dB'])
+                                                    cfg2 = this_pair['cfgB'], diam_2 = this_pair['dB'],usenull=usenull)
         cfg_pair[i]['tptg'] = tperptg
         cfg_pair[i]['tmos'] = tmos
         cfg_pair[i]['nb1'] = nb1
@@ -41,7 +44,7 @@ def runTimeRatios(uvtapers,cfg_pair):
 
         print this_pair['cfgA'], this_pair['cfgB'], tperptg, tmos, nb1, nb2
         i += 1
-
+        
     return -1
  
 
@@ -53,17 +56,27 @@ def arcsec2uv(arcsecTapers,lam = 0.003):
     uvTapers = 0.882 *lam /(arcsecTapers *3.1415/180.0/3600.0 * (lam/0.003))
     return uvTapers
 
-def compareTwoConfigs(tsums,tsums2,bmind,cfg1="alma.cycle7.1",diam_1 = 12.0, cfg2="aca.cycle7",diam_2 = 7.0):
+def compareTwoConfigs(tsums,tsums2,bmind,cfg1="alma.cycle7.1",diam_1 = 12.0, cfg2="aca.cycle7",diam_2 = 7.0,usenull=False):
     """
     compute integration time in config 2 / integ time in config 1, using provided effective number of baselines
     tsums: dictionary with sum squared weights
     cfg1, d_1 : name of cfg 1 and diam of antennas [meters]
     bmind tells you which element of tsums, tsums2 to use (each element is a sum of weights for a given taper)
+    if cfg2 is 'tp', calculate the time ratio for total power (N_B = 0.5 effectively)
+    usenull indicates to use the null taper for cfg2; null taper is assumed to be in tsums[0],tsums2[0]
     etc
     """
 
     nb1 = (tsums[cfg1][bmind])**2 / tsums2[cfg1][bmind]
-    nb2 = (tsums[cfg2][bmind])**2 / tsums2[cfg2][bmind]
+
+    if cfg2 != 'tp':
+      if not(usenull):
+        nb2 = (tsums[cfg2][bmind])**2 / tsums2[cfg2][bmind]
+      else:
+        nb2 = (tsums[cfg2][0])**2 / tsums2[cfg2][0]
+    else:
+      print " CAUTION: tp times are for a single antenna"
+      nb2 = 0.5
 
     t2_t1_perPtg = ( nb1 / nb2) * (diam_1/diam_2)**4
     t2_t1_mosaic = t2_t1_perPtg / (diam_1/diam_2)**2

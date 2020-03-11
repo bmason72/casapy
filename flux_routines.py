@@ -55,7 +55,7 @@ def assemble_fluxes(mous_list='',new_style=False,outfile_name='test',my_intent='
     pickle.dump(all_sources,open(outfile_name+'.pkl',"wb"))
 
 
-def compare_fluxes(all_sources,outfile_name='test'):
+def compare_fluxes(all_sources,outfile_name='test',frac_thresh = 0.01):
     n_eb = len(all_sources)
     nqueries=0
     mean_flux = np.array([])
@@ -66,14 +66,14 @@ def compare_fluxes(all_sources,outfile_name='test'):
     exec_number = np.array([])
     mous_name = []
     vis_name = []
-
+    
     for i in range(n_eb):
         if type(all_sources[i]['auflux']) != type(all_sources[i]['dbflux']):
             print "**** ERROR: one of the queries failed for ",all_sources[i]['mousnum']
         else:
-            print " *** ",all_sources[i]['mousnum']
-            print all_sources[i]['auflux']
-            print all_sources[i]['dbflux']
+            #print " *** ",all_sources[i]['mousnum']
+            #print all_sources[i]['auflux']
+            #print all_sources[i]['dbflux']
             if len(all_sources[i]['dbflux']) != len(all_sources[i]['auflux']):
                 print "**** ERROR: queries are of different length ",all_sources[i]['mousnum']
                 continue 
@@ -95,9 +95,10 @@ def compare_fluxes(all_sources,outfile_name='test'):
     fhandle.write("# MOUS_num EB.ms old_flux new_flux fractional_flux_difference\n")
 
     for i in range(len(new_flux)):
-        print i,mous_name[i],vis_name[i], old_flux[i], new_flux[i], flux_diff[i]/mean_flux[i]
-        mystr = mous_name[i] + " " + vis_name[i]+" "+str(old_flux[i]) +" "+ str(new_flux[i])+" "+str( flux_diff[i]/mean_flux[i])+'\n'
-        fhandle.write(mystr)
+        if ( np.abs(flux_diff[i]/mean_flux[i]) > frac_thresh):
+            print i,mous_name[i],vis_name[i], old_flux[i], new_flux[i], flux_diff[i]/mean_flux[i]
+            mystr = mous_name[i] + " " + vis_name[i]+" "+str(old_flux[i]) +" "+ str(new_flux[i])+" "+str( flux_diff[i]/mean_flux[i])+'\n'
+            fhandle.write(mystr)
 
     fhandle.close()
 
