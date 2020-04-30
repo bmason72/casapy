@@ -17,6 +17,8 @@
 # dec17 bsm - update to handle single-poln data.
 #           - change name of output text file (beware of this, may break old scripts)
 #
+# apr2020 bsm - add modules for spw phase offset QA specifically
+#
 
 from taskinit import *
 # old syntax-
@@ -26,6 +28,8 @@ from pipeline.hifv.heuristics.lib_EVLApipeutils import getCalFlaggedSoln
 import analysisUtils as au
 import pylab as pl
 import glob
+import re
+import pickle
 
 def calcAlmaPlPhaseSolStats(plDir=None,phaseField=None,outDir='./'):
 #
@@ -255,6 +259,7 @@ def calcOneTablePhases(table,ms=None,phaseField=None,solnTag='',outDir='./',manP
     print scispws
 
     for ispw in range(nspw):
+        # loop over antennas present in each spw
         if flags['antspw'][flags['ant'].keys()[0]].has_key(scispws[ispw]):
             for iant in flags['ant'].keys():
                 # bsm dec2017 - now allow for singleton returns (one IF / T soln)-
@@ -319,7 +324,7 @@ def calcOneTablePhases(table,ms=None,phaseField=None,solnTag='',outDir='./',manP
     # annotate plot & capture hard copy of it
     # bsm dec2017 - change out file to table which is much smarter than ms!
     #outfNameRoot = outDir+ms.split("/")[-1]+solnTag+'phaseSolns'
-    outfNameRoot = outDir+table+'-Fld'+str(phaseField)+'-'+solnTag+'-phaseStats'
+    outfNameRoot = outDir+table.split("/")[-1]+'-Fld'+str(phaseField)+'-'+solnTag+'-phaseStats'
     pl.title(ms.split("/")[-1]+solnTag)
     pl.legend(prop={'size':7})
     pl.savefig(outfNameRoot+'.png')
@@ -349,3 +354,375 @@ def calcOneTablePhases(table,ms=None,phaseField=None,solnTag='',outDir='./',manP
     for i in range(nspw): mystr+="  %6.0f %8.2f  " % (spw_widths[i]*1000,spw_freqs[i])
     print mystr
     fh.write(mystr+'\n')
+    fh.close()
+
+#from pipeline.hifv.heuristics.lib_EVLApipeutils import getCalFlaggedSoln
+
+def calcOneTablePhaseStats(table='',phaseField='',solnTag='',outDir=''):
+  """
+  Improved version of calcOneTablePhases. operates sensibly on single or dual pol solutions
+  returns results in a dictionary.
+  """
+
+  #solnTag="test"
+  #outDir="./"
+  manPl=False
+
+  ms=table.split(".ms")[0]+".ms"
+
+  # default to the phase cal being the highest field ID
+  if phaseField == '' or phaseField == None:
+      all_phasecals = au.getPhaseCalibrators(vis=ms)
+      if (len(all_phasecals) > 1):
+          print "***** WARNING multiple phase cals found using the lowest one"
+          phaseField = pl.amin(all_phasecals)
+      else:
+          phaseField = all_phasecals[0]
+
+  if (len(outDir) > 0):
+      outfNameRoot = outDir+table.split("/")[-1]+'-Fld'+str(phaseField)+'-'+solnTag+'-phaseStats'  
+
+  tb.open(table)
+  field=tb.getcol("FIELD_ID")
+  time=tb.getcol("TIME")
+  gain=tb.getcol("CPARAM")
+  ant=tb.getcol("ANTENNA1")
+  flag=tb.getcol("FLAG")
+  spw=tb.getcol("SPECTRAL_WINDOW_ID")
+  scan=tb.getcol("SCAN_NUMBER")
+  tb.done()
+
+  n_ant = len(ant[pl.unique(ant)])
+  n_pol = gain.shape[0]
+  print " # ant / # pol: ",str(n_ant)," " ,str(n_pol)
+
+  if (n_pol > 1):
+      print "**** WARNING: n_pol > 1!!! Expect offset table to be a T solution"
+      print table
+
+  # set up plot
+  #pl.clf()
+  #font={'size':12}
+  #pl.rc('font', **font)
+
+  # note: v.antennaNamesForAntennaIds[3] etc
+
+  #flags=getCalFlaggedSoln(table,field=phaseField)
+  flags=getCalFlaggedSoln(table)
+
+  #-----------------------
+  # get science spws for this EB
+  v=au.ValueMapping(ms)
+  scispws=pl.array(v.getSpwsForIntent("OBSERVE_TARGET#ON_SOURCE"))
+  # sometimes it gets a bogus spw
+  if (scispws[0]==0 and not(manPl)):
+      scispws=scispws[1:]
+  widths=pl.zeros(len(scispws))
+  freqs=pl.zeros(len(scispws))
+  # dec2017 - the list of windows returned by v.getSpwsForIntent and v.spwInfo() doesn't always agree
+  #  anymore.  explicitly test for membership and flag windows appropriately.
+  spw_set=set(v.spwInfo.keys())
+  for j in range(len(scispws)):
+    if (set([scispws[j]]).issubset(spw_set)):
+        widths[j]=v.spwInfo[scispws[j]]['bandwidth']/1e9
+        freqs[j]=v.spwInfo[scispws[j]]['meanFreq']/1e9
+        # filter out the TP-only spw's 
+        if len(v.spwInfo[scispws[j]]['chanFreqs'])<2: 
+            widths[j]=-1
+    else:
+        widths[j]=-1
+  z=pl.where(widths>0)[0]
+  scispws=scispws[z]
+  spw_widths=widths[z]
+  spw_freqs=freqs[z]
+  # count unique SPW ID's
+  nspw=len(scispws)
+
+  # identify "good" antennas by their flag fraction across _all_ spws
+  median=flags['antmedian']['fraction']
+  # take ants which have less flagging than 2xmedian, or if that's zero, less than 10%
+  maxflaglevel=max([0.1,2*median])
+  #-----------------------
+  # collect flag levels by ant and spw
+  # in case of skipped ant indices in dict, set all levels to 1 to start
+  flaglevelbyant=pl.zeros((nspw,max(flags['ant'].keys())+2))+10.
+
+  # also open table to calculate phase angle for rms
+  # angle lists
+  dang=[[] for _ in range(nspw)]
+
+  # index as mean_phase[spw][ant][pol]-
+  #mean_phase = [ [[[] for _ in range(n_pol)] for _ in range(n_ant)] for _ in range(nspw)]
+  #rms_phase = [ [[[] for _ in range(n_pol)] for _ in range(n_ant)] for _ in range(nspw)]
+  mean_phase=pl.zeros([nspw,n_ant,n_pol])
+  rms_phase=pl.zeros([nspw,n_ant,n_pol])
+  max_phase=pl.zeros([nspw,n_ant,n_pol])
+  is_valid = pl.zeros([nspw,n_ant,n_pol])
+  nDataAntSpwPol = pl.zeros([nspw,n_ant,n_pol])
+  all_phases=[ [] for _ in range(nspw)]
+  spw_phase_rms = pl.zeros(nspw)
+
+  flagfrac=pl.zeros(nspw)
+  rms=pl.zeros(nspw)
+  ndata=pl.zeros(nspw)
+
+  # define an array of symbols to use, one for each spw (more than we're likely to need)
+  psyms=['o','^','*','+','1','2','3','4','8','s','p']
+
+  print " NSPWs, sciSPWs: ",str(nspw)," ",str(scispws)
+
+  for ispw in range(nspw):
+      # loop over antennas present in each spw
+      if flags['antspw'][flags['ant'].keys()[0]].has_key(scispws[ispw]):
+          for iant in flags['ant'].keys():
+              # bsm dec2017 - now allow for singleton returns (one IF / T soln)-
+              #if (len(flags['antspw'][iant][scispws[ispw]]) > 1):
+              if (n_pol >1):
+                  flaglevelbyant[ispw,iant] = \
+                                              max([flags['antspw'][iant][scispws[ispw]][0]['fraction'],
+                                                   flags['antspw'][iant][scispws[ispw]][1]['fraction']])
+              else:
+                  flaglevelbyant[ispw,iant] = flags['antspw'][iant][scispws[ispw]][0]['fraction']
+          goodants = pl.where(flaglevelbyant[ispw,:]<maxflaglevel)[0]
+          print "Ngoodants: ",str(len(goodants))," SPW ",str(scispws[ispw])
+          # convert to percent
+          flagfrac[ispw] = \
+              pl.average(flaglevelbyant[ispw,goodants])*100 
+
+
+          zk=[]
+          # loop over ant, pol and calculate phase solution stats
+          for k in pl.array(flags['ant'].keys())[goodants]:
+            for pp in range(n_pol):
+              znk=pl.where((field==phaseField)*(spw==scispws[ispw])*(flag[pp,0,:]==False)*(ant==k))[0]
+              if len(znk)>0:
+                  # phases of the requested field, spw, ant,pol solns-
+                  this_phase=pl.angle(gain[pp,0,znk.astype('int')])
+                  # ensure that the solutions are sorted in increasing scan order
+                  these_scans = scan[znk]
+                  scan_sort_ind = pl.argsort(these_scans)
+                  these_scans = these_scans[scan_sort_ind]
+                  this_phase = this_phase[scan_sort_ind]
+                  # skip unwrapping, it causes problems at v.high noise-
+                  #unwrapped_phase = pl.unwrap(this_phase) * 180.0/pl.pi
+                  unwrapped_phase = this_phase * 180.0/pl.pi
+                  mean_phase[ispw,k,pp] = unwrapped_phase.mean() 
+                  rms_phase[ispw,k,pp] = pl.std(unwrapped_phase)
+                  max_phase[ispw,k,pp] = pl.amax(pl.absolute(unwrapped_phase))
+                  is_valid[ispw,k,pp] = 1
+                  nDataAntSpwPol[ispw,k,pp] = len(znk)
+                  all_phases[ispw] = pl.concatenate((all_phases[ispw],list(unwrapped_phase)))
+
+  spw_avg_phase = pl.zeros([nspw])
+  all_phases = pl.array(all_phases)
+  #spw_avg_phase = pl.median(all_phases,axis=1)
+  for i in range(nspw):
+      spw_avg_phase[i] = pl.median(all_phases[i])
+      spw_phase_rms[i] = au.MAD(all_phases[i])
+
+  #results = {'scispws':scispws,'freq':spw_freqs,'width':spw_widths,'npol':n_pol,'nant':n_ant,'nDataAntSpwPol': nDataAntSpwPol,
+  #           'meanPhaseAntSpw':mean_phase,'rmsPhaseAntSpw':rms_phase,'rmsPhaseSpw':spw_phase_rms,
+  #           'flagFracSpw':flagfrac,'valueMapping':v,'isValid':is_valid,'tableName':table,'phaseField':phaseField}
+
+  results = {'scispws':scispws,'freq':spw_freqs,'width':spw_widths,'npol':n_pol,'nant':n_ant,'nDataAntSpwPol': nDataAntSpwPol,
+             'meanPhaseAntSpw':mean_phase,'rmsPhaseAntSpw':rms_phase,'rmsPhaseSpw':spw_phase_rms,'maxPhaseAntSpw': max_phase,
+             'flagFracSpw':flagfrac,'valueMapping':v.antennaNamesForAntennaIds,'isValid':is_valid,'tableName':table,'phaseField':phaseField}
+
+  # write numbers to file and stdout
+  if (len(outDir) > 0):
+    print " OPENING "+outfNameRoot+".txt"
+    fh=open(outfNameRoot+'.txt','w')
+    fh.write("# "+table+'\n')
+    mystr="# %25s %s nwin "% (' ',ms)
+    for i in range(nspw): mystr+="  %6.0fMHz(%2i)   " % (spw_widths[i]*1000,scispws[i])
+    for i in range(nspw): mystr+="  %10s %12s  " % ('BW/MHz','CFreq/GHz')  
+    print mystr
+    fh.write(mystr+'\n')   
+    mystr="%18s %s-flag" % (' ',solnTag)
+    mystr+=" %3i " % nspw
+    for i in range(nspw): mystr+="  %8.1f pct  " % (flagfrac[i])
+    for i in range(nspw): mystr+="  %6.0f %8.2f " % (spw_widths[i]*1000,spw_freqs[i])
+    print mystr
+    fh.write(mystr+'\n')
+    mystr="%19s %s-rms"%(" ",solnTag)
+    mystr+=" %3i " % nspw
+    for i in range(nspw): mystr+="  %8.1f deg  " % (spw_phase_rms[i])
+    for i in range(nspw): mystr+="  %6.0f %8.2f  " % (spw_widths[i]*1000,spw_freqs[i])
+    print mystr
+    fh.write(mystr+'\n')
+    mystr="%21s %s-N" %(" ",solnTag)
+    mystr+=" %3i " % nspw
+    for i in range(nspw): mystr+="  %11i  " % (ndata[i])
+    for i in range(nspw): mystr+="  %6.0f %8.2f  " % (spw_widths[i]*1000,spw_freqs[i])
+    fh.close()
+    print " SAVING raw results "
+    fh2=open(outfNameRoot+'.pkl',"wb")
+    pickle.dump(results,fh2)
+    fh2.close()
+
+  return results
+
+def doSpwPhaseQa(phaseStatDict,outdir=''):
+  # threshold in deg
+  #S0info = 2.0
+  #S0warn = 5.0
+  #Finfo = 5.0
+  #Fwarn = 5.0
+  #Ginfo = 5.0
+  #Gwarn = 5.0
+
+  #results = {'scispws':scispws,'freq':spw_freqs,'width':spw_widths,'npol':n_pol,nant:n_ant,
+  #           'meanPhaseAntSpw':mean_phase,'rmsPhaseAntSpw':rms_phase,'rmsPhaseSpw':spw_phase_rms,
+  #           'flagFracSpw':flagfrac,'valueMapping':v}
+
+  nspw = len(phaseStatDict['scispws'])
+  spw_phase_rms = phaseStatDict['rmsPhaseSpw']
+  n_pol = phaseStatDict['npol']
+  n_ant = phaseStatDict['nant']
+  is_valid = phaseStatDict['isValid']
+  mean_phase = phaseStatDict['meanPhaseAntSpw']
+  rms_phase = phaseStatDict['rmsPhaseAntSpw']
+  max_phase = phaseStatDict['maxPhaseAntSpw']
+  scispws = phaseStatDict['scispws']
+  valueMapping = phaseStatDict['valueMapping']
+  table = phaseStatDict['tableName']
+  nDataAntSpwPol = phaseStatDict['nDataAntSpwPol']
+
+  mousName = (table.split("MOUS_uid___"))[-1].split('/')[0]
+  # ebName = (mousName.split("working/"))[-1]
+  ebName = table.split("MOUS_uid___")[-1].split("working/")[1].split(".ms")[0]
+  #search for project in table name...
+  projName = "NoProj"
+  m=re.search("20[1,2,3][0-9]\..\.[0-9][0-9][0-9][0-9][0-9]\..",table)
+  if (m != None):
+    projName = m.group(0)
+  m=re.search("E2E[0-9]\..\.[0-9][0-9][0-9][0-9][0-9]\..",table)
+  if (m != None):
+    projName = m.group(0)
+
+  if (len(outdir) > 0):
+      #outfNameRoot = outdir+table.split("/")[-1]+'-Fld'+str(phaseField)+'-spwPhaseQAInfo'  
+      #outfNameRoot = outdir+table.split("/")[-1]+'-spwPhaseQAInfo'  
+      outfNameRoot = outdir+projName+"_"+mousName+"_"+ebName+"-spwPhaseQAInfo" 
+      fh=open(outfNameRoot+'.txt','w')
+      doFile=True
+  else:
+    doFile=False
+
+  mystring = projName + " " + mousName + " " + ebName
+  print mystring
+  if (doFile): fh.write(mystring+'\n')
+
+  print "# Mean, RMS spwRms (RMS/spwRms) max (max/RMS) for each SPW, Ant, {Pol}"
+  for antind in range(n_ant):
+    for spwind in range(nspw):
+      for polind in range(n_pol):
+        mystr = "# "+valueMapping[antind]+" SPW"+str(scispws[spwind])
+        mystr+= " "+str(polind)
+        mystr+= " "+str(mean_phase[spwind,antind,polind])+' , '+str(rms_phase[spwind,antind,polind]) + '   '+str(spw_phase_rms[spwind]) + ' (' + str(rms_phase[spwind,antind,polind]/spw_phase_rms[spwind])+') ' + str(max_phase[spwind,antind,polind]) + ' ('+str(max_phase[spwind,antind,polind]/rms_phase[spwind,antind,polind])+')'
+        print mystr
+        if (doFile and is_valid[spwind,antind,polind]): fh.write(mystr+'\n')
+
+  print " Evaluating SPW Phase Offset QA For Table: ",phaseStatDict['tableName']
+
+  antSpwQaScore = pl.ones([nspw,n_ant,n_pol])
+  for spwind in range(nspw):
+      good_data = True
+      # 15 deg threshold is SNR~3 per solution. it is also about where we start failing
+      #  to detect 60 deg mean spw phase offsets when we have 2 solutions.
+      if spw_phase_rms[spwind] > 15.0:
+          good_data = False
+          mystring = "QQ NOTICE: phase noise generally too high to evaluate SPW relative phase stability"+ projName+" "+mousName+" "+ebName+" spw: "+str(scispws[spwind])
+          print mystring
+          fh.write(mystring+'\n')
+      # write message here. 
+      for antind in range(n_ant):
+          for polind in range(n_pol):
+              # propagate the score to each ant/spw/pol if the phase RMS was high-
+              if (not(good_data) and is_valid[spwind,antind,polind]):
+                  antSpwQaScore[spwind,antind,polind] =  0.8
+              elif is_valid[spwind,antind,polind]: 
+                  skip_rms = False
+                  # require at least 4 data points 
+                  ndata = nDataAntSpwPol[spwind,antind,polind]
+                  if ndata < 4:
+                      skip_rms = True
+                  if (skip_rms):
+                      antSpwQaScore[spwind,antind,polind] = 0.8
+                      mystring = "QQ NOTICE: insufficient data to fully evaluate SPW Phase Offsets for "+ projName+" "+mousName+" "+ebName+" spw: "+str(scispws[spwind])+" "+str(valueMapping[antind])+" pol: "+str(polind)
+                      print mystring
+                      fh.write(mystring+'\n')
+
+                  mn_info_thresh = pl.amax([6.0*spw_phase_rms[spwind]/(ndata)**0.5,15.0])
+                  mn_warn_thresh = pl.amax([6.0*spw_phase_rms[spwind]/(ndata)**0.5,30.0])
+                  rms_info_thresh = pl.amax([2.0*spw_phase_rms[spwind],15.0])
+                  rms_warn_thresh = pl.amax([4.0*spw_phase_rms[spwind],30.0])
+                  max_info_thresh = pl.amax([6.0*spw_phase_rms[spwind],15.0])
+                  max_warn_thresh = pl.amax([6.0*spw_phase_rms[spwind],30.0])
+
+                  trig_mn_info = (pl.absolute(mean_phase[spwind,antind,polind]) > mn_info_thresh)
+                  trig_mn_warn = (pl.absolute(mean_phase[spwind,antind,polind]) > mn_warn_thresh)
+                  if skip_rms:
+                      trig_rms_info = False
+                      trig_rms_warn = False
+                  else:
+                      trig_rms_info = (rms_phase[spwind,antind,polind] > rms_info_thresh)
+                      trig_rms_warn = (rms_phase[spwind,antind,polind] > rms_warn_thresh)
+                  trig_max_info = max_phase[spwind,antind,polind] > max_info_thresh
+                  trig_max_warn = max_phase[spwind,antind,polind] > max_warn_thresh
+                  if (trig_rms_info or trig_mn_info or trig_max_info):
+                    antSpwQaScore[spwind,antind,polind] = 0.8
+                  if (trig_rms_warn or trig_mn_warn or trig_max_warn):
+                    antSpwQaScore[spwind,antind,polind] = 0.5
+                  # write antenna-specific QA score and supporting diagnostic info if appropriate-
+                  if (antSpwQaScore[spwind,antind,polind] < 1.0):
+                    mystring = " NOTICE: "
+                    if ((antSpwQaScore[spwind,antind,polind] < 0.8)):
+                      mystring = " WARNING: "
+                    mystring += projName+" "+mousName+" "+ebName+" spw: "+str(scispws[spwind])+" "+str(valueMapping[antind])+" pol: "+str(polind)+" mean,rms,spwRms "+str(mean_phase[spwind,antind,polind])+" "+str(rms_phase[spwind,antind,polind])+" "+str(spw_phase_rms[spwind])+" QAscore (fromMean?,fromRms?,fromMax?): "+str(antSpwQaScore[spwind,antind,polind])+ " (" + str(int(trig_mn_info or trig_mn_warn)) + " " + str(int(trig_rms_info or trig_rms_warn))+" "+str(int(trig_max_info or trig_max_warn))+")"
+                    print mystring
+                    if (doFile): fh.write(mystring+'\n')
+                    #print mystring," spw,ant,pol, mean phase, rms phase, spw rms phase /// QA Score: ",scispws[spwind],v.antennaNamesForAntennaIds[antind],polind,mean_phase[spwind,antind,polind],rms_phase[spwind,antind,polind],spw_phase_rms[spwind]," /// ",antSpwQaScore[spwind,antind,polind]
+
+  spwQaScore = pl.ones(nspw)              
+  spwPhaseRms_notices = 0
+  spwPhaseRms_tot = nspw
+  for spwind in range(nspw):
+      mystring= " INFO: "+ projName+" "+mousName+" "+ ebName+" spw: "+str(scispws[spwind])+" SPW RMS ("+str(spw_phase_rms[spwind])+" deg.)"
+      print mystring
+      if (doFile): fh.write(mystring+'\n')
+      #if spw_phase_rms[spwind] > 5.0*S0info:
+      #    spwQaScore[spwind] = 0.8
+      #    mystring= " INFO: "+ projName+" "+mousName+" "+ ebName+" spw: "+str(scispws[spwind])+" high SPW RMS ("+str(spw_phase_rms[spwind])+" deg.) QAscore: "+str(spwQaScore[spwind])
+        
+  #finalScore = pl.amin( [pl.amin(antSpwQaScore),pl.amin(spwQaScore)])
+  finalScore = pl.amin(antSpwQaScore)
+  mystring= "QQ FINAL QAscore "+projName+" "+mousName+" "+ebName+" "+str(finalScore)
+  print mystring
+  if (doFile): 
+    fh.write(mystring+'\n')
+    fh.write(" Table: "+table+'\n')
+
+  # to be finished -- loop for problem antennas goes here - 
+  print "# Mean, RMS spwRms (RMS/spwRms) max (max/RMS) for each SPW, Ant, {Pol}"
+  for spwind in range(nspw):
+    mystr = "QQ Problem Antennas for SPW "+str(scispws[spwind])+" "
+    was_problem = False
+    for antind in range(n_ant):
+      thisQa = 1.0
+      for polind in range(n_pol):
+          thisQa = pl.amin([thisQa,antSpwQaScore[spwind,antind,polind]])
+      if thisQa < 0.66:
+          mystr += "*"
+      if thisQa < 0.9:
+          mystr += valueMapping[antind]+","
+          was_problem = True
+    if was_problem:
+        print mystr
+        if (doFile): fh.write(mystr+'\n')
+  
+  if (doFile): fh.close()
+
+  return finalScore
+
+  # end
