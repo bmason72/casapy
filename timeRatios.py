@@ -32,7 +32,7 @@ def runTimeRatios(uvtapers,cfg_pair,usenull=False):
     tsums2,tsums=getTaperedSums(bl,uvtapers)
 
     i=0
-    print "cfg1   cfg2   t2/t1(perPtg)   t2/t1(mosaic)    nb1   nb2"
+    print("cfg1   cfg2   t2/t1(perPtg)   t2/t1(mosaic)    nb1   nb2 taper")
     for this_pair in cfg_pair:
 
         tperptg,tmos,nb1,nb2 = compareTwoConfigs(tsums,tsums2,this_pair['bmind'],cfg1 = this_pair['cfgA'], diam_1 = this_pair['dA'],
@@ -42,18 +42,20 @@ def runTimeRatios(uvtapers,cfg_pair,usenull=False):
         cfg_pair[i]['nb1'] = nb1
         cfg_pair[i]['nb2'] = nb2
 
-        print this_pair['cfgA'], this_pair['cfgB'], tperptg, tmos, nb1, nb2
+        print(this_pair['cfgA'], this_pair['dA'],this_pair['cfgB'], this_pair['dB'],tperptg, "***",tmos,"***", nb1, nb2,this_pair['bmind'])
         i += 1
         
     return -1
  
 
+# um why is lambda in there twice - answer: because the result is in meters
 def arcsec2uv(arcsecTapers,lam = 0.003):
     """
-    convert FWHM beams to corresponding Gaussian FWHM in uv space 
+    convert FWHM beams to corresponding Gaussian FWHM in aperture space (units of meters)
     assuming wavelength is lam [meters]
     """  
     uvTapers = 0.882 *lam /(arcsecTapers *3.1415/180.0/3600.0 * (lam/0.003))
+    #uvTapers = 0.882 *lam /(arcsecTapers *3.1415/180.0/3600.0)
     return uvTapers
 
 def compareTwoConfigs(tsums,tsums2,bmind,cfg1="alma.cycle7.1",diam_1 = 12.0, cfg2="aca.cycle7",diam_2 = 7.0,usenull=False):
@@ -75,7 +77,7 @@ def compareTwoConfigs(tsums,tsums2,bmind,cfg1="alma.cycle7.1",diam_1 = 12.0, cfg
       else:
         nb2 = (tsums[cfg2][0])**2 / tsums2[cfg2][0]
     else:
-      print " CAUTION: tp times are for a single antenna"
+      print(" CAUTION: tp times are for a single antenna")
       nb2 = 0.5
 
     t2_t1_perPtg = ( nb1 / nb2) * (diam_1/diam_2)**4
@@ -107,17 +109,17 @@ def demeanConfig(cfg,add_mean=None):
     # dict() is needed to make an actual copy-
     new_cfg = dict(cfg)
     station_list = cfg.keys()
-    print station_list
+    print(station_list)
     x1_vals = numpy.array([])
     x2_vals = numpy.array([])
     x3_vals = numpy.array([])
     if add_mean == None:
         for this_station in station_list:
-            print this_station
+            print(this_station)
             x1_vals=numpy.append(x1_vals,(float(cfg[this_station]['coord'][0])))
             x2_vals=numpy.append(x2_vals,(float(cfg[this_station]['coord'][1])))
             x3_vals=numpy.append(x3_vals,(float(cfg[this_station]['coord'][2])))
-            print x1_vals
+            print(x1_vals)
             x1_mn = numpy.mean(x1_vals)
             x2_mn = numpy.mean(x2_vals)
             x3_mn = numpy.mean(x3_vals)
@@ -145,6 +147,7 @@ def readConfigurationFiles():
     for i in range(len(cfgFiles)):
 
         cfgName = os.path.basename(cfgFiles[i]).replace('.cfg', '')
+        #print("Reading "+cfgFiles[i])
 
         f = open(cfgFiles[i])
         fc = f.readlines()
@@ -156,13 +159,20 @@ def readConfigurationFiles():
     
             fc1 = fc[j].strip()
 
-            if fc1[0] == '#': continue
-            fc1 = fc1.split()
+            #print fc1
 
-            coordX = fc1[0]
-            coordY = fc1[1]
-            coordZ = fc1[2]
-            padName = fc1[4]
+            try:
+              if fc1[0] == '#': continue
+              fc1 = fc1.split()
+              coordX = fc1[0]
+              coordY = fc1[1]
+              coordZ = fc1[2]
+              padName = fc1[4]
+            except:
+              print(" ERROR! Bad line")
+              print(fc[j])
+              print("  in file: "+cfgFiles[i])
+              break
 
             cfgInfo[cfgName][padName] = {}
             cfgInfo[cfgName][padName]['coord'] = [coordX, coordY, coordZ]
@@ -202,11 +212,12 @@ def getUv():
 
         blInfo[i] = {}
 
-        for j in itertools.combinations(cfgInfo[i].keys(), 2):
-
+        npoints = itertools.combinations(cfgInfo[i].keys(), 2)
+        for j in npoints:
             distx = (float(cfgInfo[i][j[0]]['coord'][0]) - float(cfgInfo[i][j[1]]['coord'][0]))
             disty = (float(cfgInfo[i][j[0]]['coord'][1]) - float(cfgInfo[i][j[1]]['coord'][1]))
             blInfo[i][j] = numpy.array([distx,disty])
+
 
     return blInfo
 
@@ -216,7 +227,7 @@ def getBaselineStats():
 
     for i in sorted(blInfo.keys()):
     
-        print i, round(numpy.min(blInfo[i].values()), 1), round(numpy.mean(blInfo[i].values()), 1), round(numpy.max(blInfo[i].values()), 1)
+        print( i, round(numpy.min(blInfo[i].values()), 1), round(numpy.mean(blInfo[i].values()), 1), round(numpy.max(blInfo[i].values()), 1))
 
 def getConfigurationOverlap():
 
@@ -262,14 +273,14 @@ def getConfigurationOverlap():
 #         print 'time ratio', round(timeRatio, 3)
 #         print ''
 
-        print i[cfgComp], i[cfgExt], round(timeRatio, 2)
+        print(i[cfgComp], i[cfgExt], round(timeRatio, 2))
 
 def getPadLocations(myCfg):
     cfgInfo = readConfigurationFiles()
     xvals = numpy.array([])
     yvals = numpy.array([])
     if myCfg not in cfgInfo.keys():
-        print " **** ERROR: requested configuration file not found"
+        print(" **** ERROR: requested configuration file not found")
         return numpy.array(-1.0),numpy.array(-1.0)
     else:
         pads = cfgInfo[myCfg].keys()
